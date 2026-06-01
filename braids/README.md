@@ -1054,3 +1054,158 @@ Build Process
 2. Bootloader `.cc` files are compiled to a `.hex` file.
 3. Main firmware `.cc` files are compiled to a `.hex` file.
 4. The two hex files are merged into the final binary written to the MCU.
+
+---
+
+## Code Architecture
+
+This section describes the firmware architecture in technical detail for embedded C++ developers who want to understand the DSP pipeline, control flow, and design decisions.
+
+### Target Hardware
+
+Braids runs on an STM32F103 (Cortex-M3) clocked at 72 MHz with no FPU. All DSP must be done in fixed-point integer arithmetic using 16- and 32-bit operations. The audio output goes through an external SPI DAC driven by Timer 1 at 96 kHz. CV inputs are read via a 4-channel SPI ADC (MCP3204 or equivalent). The encoder and 4-character LED display are managed in software.
+
+### Boot and Initialization (`braids.cc`, `Init()`)
+
+`Init()` runs once from `main()`. It configures the system clock via `sys.Init(F_CPU / 96000 - 1, true)`, which sets Timer 1 to fire at 96 kHz -- one interrupt per audio sample. All subsystems are initialized in order: settings (loaded from flash), UI, ADC, DAC, `MacroOscillator`, `Quantizer`, internal ADC (on-chip temperature sensor), `Envelope`, and `SignatureWaveshaper` (seeded from the MCU unique ID with `GetUniqueId(1)`).
+
+The audio double-buffer is pre-zeroed: `audio_samples[kNumBlocks][kBlockSize]` with `kNumBlocks = 4` and `kBlockSize = 24`. `playback_block` starts at 2 (the midpoint) and `render_block` starts at 0, creating a half-buffer headstart so the ISR never catches up to rendering.
+
+### Interrupt Service Routine (`TIM1_UP_IRQHandler`)
+
+The Timer 1 update ISR fires every 10.4 µs (at 96 kHz). It does three things:
+
+1. **DAC write.** `dac.Write(-audio_samples[playback_block][current_sample] + 32768)` converts the signed 16-bit sample to unsigned and sends it to the DAC over SPI2 using a manually timed 16-bit write (two 8-bit SPI transfers with `nop` padding for setup/hold timing).
+
+2. **Gate/trigger detection.** `gate_input.raised()` is polled every sample. Rising edges set `trigger_detected_flag`. After all 4 ADC channels are scanned, trigger delay (configurable from 0 to 127 samples via `settings.trig_delay()`) is counted down before `trigger_flag` is set for the render loop to consume.
+
+3. **ADC scan.** `adc.PipelinedScan()` advances a 3-stage SPI state machine, scanning one of the 4 CV channels per call. It returns `true` when all 4 channels have been read (once per 4 ISR firings = every 4 samples = 24 kHz). On that completion event, `ui.UpdateCv()` is called to snapshot the 4 ADC channels for use in the render block.
+
+The ISR advances `current_sample` and wraps `playback_block` at `kBlockSize = 24`. The render loop in `main()` runs whenever `render_block != playback_block` (i.e., there is at least one block of headroom).
+
+### Main Loop and `RenderBlock()`
+
+`main()` is a simple spin loop:
+
+```cpp
+while (1) {
+    while (render_block != playback_block) {
+        RenderBlock();
+    }
+    ui.DoEvents();
+}
+```
+
+`RenderBlock()` executes once per 24-sample block (at 4 kHz). The render pipeline is:
+
+1. **Envelope update.** `envelope.Update(attack * 8, decay * 8)` sets the exponential increment rates from settings, then `envelope.Render()` returns the current 16-bit envelope value. The `Envelope` class in `envelope.h` uses `lut_env_portamento_increments` for exponential attack/decay shaping and runs a two-segment (attack, decay) AD envelope internally.
+
+2. **Shape selection.** If `settings.meta_modulation()` is enabled, the FM CV input (`adc.channel(3)`) is used to offset the current oscillator shape, allowing voltage-controlled algorithm selection across all 47 modes. Hysteresis of ±2 ADC codes prevents single-bit jitter from flickering between adjacent shapes. The QUESTION_MARK shape (easter egg) is forced if `ui.paques()` returns true (a hidden trigger from the menu system).
+
+3. **Parameter computation.** TIMBRE (`adc.channel(0)`) and COLOR (`adc.channel(1)`) are read and scaled through `settings.adc_to_parameter()` (applies calibrated offset and scale). The AD envelope value is optionally mixed in: `value += ad_value * settings.GetValue(SETTING_AD_TIMBRE) >> 5`.
+
+4. **Pitch computation.** Pitch CV (`adc.channel(2)`) is processed through `settings.adc_to_pitch()` (which applies the two-point calibration: `pitch = adc * pitch_cv_scale >> 12 + pitch_cv_offset`), then through `quantizer.Process()` for optional scale quantization. FM CV is added unless meta-modulation is active. Pitch from `VcoJitterSource::Render()` (slow sinusoidal drift seeded by a random walk) and the on-chip temperature ADC (`internal_adc.value() >> 8`) are both added. The AD envelope can modulate FM. The result is clamped to `[0, 16383]`. If `vco_flatten` is enabled, a lookup table (`lut_vco_detune`) compensates for exponential-to-linear nonlinearity in the V/OCT input scaling.
+
+5. **Strike propagation.** If `trigger_flag` is set, `osc.Strike()` is called (which calls `digital_oscillator_.Strike()` setting `strike_ = true`), and `envelope.Trigger(ENV_SEGMENT_ATTACK)` restarts the envelope. `ui.StepMarquee()` advances the display animation on each gate.
+
+6. **Oscillator render.** `osc.Render(sync_buffer, render_buffer, kBlockSize)` dispatches through the function pointer table to the active algorithm. Note: if any AD modulation routing is active (timbre, color, FM, or VCA), `sync_buffer` is zeroed before rendering to prevent the sync signal (normally passed from gate input) from reaching the oscillator -- because the internal modulation implies the module is operating in an "AD triggered" context where hard sync from the trigger would be redundant.
+
+7. **Output post-processing.** After rendering, the output block passes through:
+   - **Sample rate reduction**: `decimation_factors[] = { 24, 12, 6, 4, 3, 2, 1 }` -- at the lowest rate (4 kHz), every 24th sample is held, resulting in classic lo-fi decimation.
+   - **Bit crushing**: `bit_reduction_masks[]` zeroes the LSBs of each sample, from 2-bit (mask `0xc000`) to full 16-bit resolution.
+   - **VCA**: `gain = settings.GetValue(SETTING_AD_VCA) ? ad_value : 65535`. The gain is smoothed through a first-order IIR: `gain_lp += (gain - gain_lp) >> 4`, applied as `sample = held_sample * gain_lp >> 16`. This prevents clicks from hard gain jumps.
+   - **Signature waveshaping**: `ws.Transform(sample)` applies the per-device transfer function. The result is mixed with the dry signal: `Mix(sample, warped, signature)` where `signature = settings.signature() * settings.signature() * 4095` (squared to give a nonlinear amount knob feel).
+
+### Oscillator Architecture: Three-Layer Dispatch
+
+The oscillator system uses a three-layer class hierarchy with virtual-function-free, function-pointer dispatch at each layer:
+
+**`MacroOscillator`** owns 3 `AnalogOscillator` instances, 1 `DigitalOscillator`, temporary buffers (`sync_buffer_[24]`, `temp_buffer_[24]`), and an `lp_state_` for the MORPH mode filter. Its `Render()` method dispatches via `fn_table_[]` -- a static array of member-function pointers indexed by `MacroOscillatorShape`. The 47 shapes map to a much smaller set of actual render functions: 9 macro-level renderers plus `RenderDigital()`, which forwards to `DigitalOscillator` for 33 of the shapes.
+
+`RenderDigital()` computes the `DigitalOscillatorShape` enum value by subtracting the offset `MACRO_OSC_SHAPE_TRIPLE_RING_MOD` from the current macro shape:
+```cpp
+digital_oscillator_.set_shape(static_cast<DigitalOscillatorShape>(
+    shape_ - MACRO_OSC_SHAPE_TRIPLE_RING_MOD));
+```
+This means the `MacroOscillatorShape` and `DigitalOscillatorShape` enumerations must stay in sync with a fixed offset between them.
+
+**`AnalogOscillator`** has its own `fn_table_[]` over 9 shapes (`OSC_SHAPE_SAW`, `OSC_SHAPE_VARIABLE_SAW`, `OSC_SHAPE_CSAW`, `OSC_SHAPE_SQUARE`, `OSC_SHAPE_TRIANGLE`, `OSC_SHAPE_SINE`, `OSC_SHAPE_TRIANGLE_FOLD`, `OSC_SHAPE_SINE_FOLD`, `OSC_SHAPE_BUZZ`). Shape changes force `Init()` to be called at the start of `Render()`, resetting phase and interpolation state to prevent transient artifacts. `ComputePhaseIncrement()` uses `lut_oscillator_increments`, a table covering one octave at the top of the MIDI range (`kPitchTableStart = 128 * 128`), with octave folding via bit-shifting: the pitch is shifted up by octaves until it fits the table range, the increment is looked up with linear interpolation between adjacent entries, then right-shifted back by the number of octaves.
+
+**`DigitalOscillator`** follows the same dispatch pattern and adds `ComputeDelay()` (using `lut_oscillator_delays`) for algorithms requiring delay line lengths tuned to pitch (physical modeling, comb filter). It also holds a union `DigitalOscillatorState` that overlaps all per-algorithm state in a single block of memory (reusing it across shape changes), and a union `delay_lines_` that overlaps the delay-line buffers for comb filter, Karplus-Strong, bowed string, blown bore, and fluted bore -- all sharing the same ~16 KB of RAM.
+
+The `strike_` flag inside `DigitalOscillator` is set by `Strike()` and consumed at the start of each algorithm's render function to trigger percussive/physical-model excitation events (noise injection, phase reset, partial amplitude reset, etc.).
+
+### `DigitalOscillatorState`: Memory Reuse via Union
+
+A design that stands out is the `DigitalOscillatorState` union in `digital_oscillator.h`. All 15+ per-algorithm state structs (`ResoSquareState`, `VowelSynthesizerState`, `SawSwarmState`, `PluckState`, `FeedbackFmState`, `ParticleNoiseState`, `PhysicalModellingState`, `Grain[4]`, `FofState`, `ToyState`, `SvfState`, `AdditiveState`, `DigitalModulationState`, `ClockedNoiseState`, `HatState`, `HarmonicsState`) all overlay the same memory. `Init()` does a single `memset(&state_, 0, sizeof(state_))` which zeroes all state regardless of which algorithm will use it. This avoids the need for a separate heap or algorithm-specific allocation -- the MCU has approximately 20 KB of SRAM and every byte counts.
+
+The `RenderTripleRingMod()` function is a good example of opportunistic union reuse: it stores its three modulator phases in `state_.vow.formant_phase[]` -- the `VowelSynthesizerState`'s formant phase array -- because those fields happen to be the right size and type. This is intentional, documented by the struct field names being borrowed from an unrelated algorithm.
+
+### Parameter Interpolation (`parameter_interpolation.h`)
+
+Control rates (ADC scan + render block rate) are 4 kHz, but audio is 96 kHz. Updating oscillator parameters at block boundaries with no smoothing would produce 4 kHz zipper noise audible as sidebands on the audio signal -- especially for FM modulation indices and waveshaping amounts.
+
+The solution is linear interpolation macros that expand inline into per-sample ramping code. `BEGIN_INTERPOLATE_PARAMETER_0` computes `parameter_0_start` (previous value), `parameter_0_delta` (target - previous), and `parameter_increment = 32767 / size`. Inside the sample loop, `INTERPOLATE_PARAMETER_0` advances `parameter_xfade` and computes `parameter_0 = start + (delta * xfade >> 15)`. `END_INTERPOLATE_PARAMETER_0` stores the new value as the previous for the next block.
+
+Phase increment interpolation (`BEGIN_INTERPOLATE_PHASE_INCREMENT`) works the same way but handles the unsigned 32-bit phase increment, using unsigned subtraction to correctly handle wrapping across the 2^32 boundary.
+
+### CV-to-Pitch Calibration (`settings.cc`, `Settings::Calibrate()`)
+
+The calibration wizard (accessed via the menu system) captures two ADC codes at C2 and C4 to compute a linear fit:
+```cpp
+int32_t scale = (24 * 128 * 4096L) / (adc_code_c4 - adc_code_c2);
+data_.pitch_cv_offset = (60 << 7) - (scale * ((c2 + c4) >> 1) >> 12);
+```
+The factor `24 * 128` is 24 semitones (2 octaves) in the internal pitch representation (128 units per semitone). The factor 4096 is a fixed-point scaling factor. `adc_to_pitch()` applies this scale/offset at runtime. The FM CV has a separate offset calibrated to 0V.
+
+The `adc_to_parameter()` function applies per-channel offset/scale calibration for TIMBRE and COLOR CVs (though the calibration code for these is commented out in `Calibrate()`, the infrastructure is in place).
+
+### UI: Encoder, Display, and Mode State Machine (`ui.cc`, `ui.h`)
+
+`Ui::Poll()` runs from the 1 kHz SysTick ISR (`SysTick_Handler`). It debounces the encoder button via `encoder_.Debounce()`, detects short clicks (`CONTROL_ENCODER_CLICK`) and long presses (>800 ms, `CONTROL_ENCODER_LONG_CLICK`), reads encoder increments, and pushes events into an `EventQueue<16>`. The display is refreshed every other `Poll()` call (500 Hz) via `display_.Refresh()`.
+
+`Ui::DoEvents()` runs in the main loop (between render blocks). It drains the event queue, dispatching to `OnClick()`, `OnLongClick()`, and `OnIncrement()`. The UI is a simple modal state machine with 6 modes:
+
+- `MODE_SPLASH` -- startup animation (8 frames of the animated braids logo character), transitions to `MODE_EDIT` after 50 idle ticks.
+- `MODE_EDIT` -- encoder changes the current setting value. Only one setting is visible at a time (the setting last navigated to in the menu). A click enters the menu.
+- `MODE_MENU` -- encoder scrolls through the `settings_order_[]` list of settings. Clicking on an editable setting returns to `MODE_EDIT`. Clicking on special settings (`SETTING_VERSION`) or long-pressing on `SETTING_CALIBRATION` / `SETTING_MARQUEE` enters dedicated sub-modes.
+- `MODE_CALIBRATION_STEP_1` / `MODE_CALIBRATION_STEP_2` -- two-step pitch CV calibration wizard.
+- `MODE_MARQUEE_EDITOR` -- 4-character scrolling text editor for the custom display text.
+
+The display in `MODE_EDIT` calls `settings.metadata(setting_).strings[value]` to look up the string for the current setting value. The `SettingMetadata` struct holds `min_value`, `max_value`, a 4-character name, and a pointer to an array of display strings. Settings are serialized as raw bytes into `SettingsData` and accessed via a type-punned byte pointer (`data[setting] = value`), relying on the enum values matching the struct field order.
+
+The CV tester mode reads `cv_[]` (updated by `UpdateCv()` from the ISR) and renders a crude 4-segment bar graph using characters in the display font's upper range (`'\x90'` + level). The marquee mode scrolls arbitrary text seeded by TIMBRE CV position and trigger count.
+
+### Analog VCO Emulation Features
+
+Two mechanisms simulate analog VCO behavior:
+
+**`VcoJitterSource`** (`vco_jitter_source.h`) models slow temperature-induced pitch drift. The algorithm uses a rare-event random walk: with probability `1/65536` per render block, a new LCG step is computed and the phase of a slow sinusoidal modulator is advanced. A two-level IIR filter (external temperature -> room temperature, each at 1/65536 per sample) smoothes this into a very slow, organic pitch wobble. Intensity is controlled by the `vco_drift` setting and scales the output.
+
+**`vco_flatten`** applies a precomputed correction table (`lut_vco_detune`) via `Interpolate88()` to compensate for V/OCT tracking errors -- useful when the module is calibrated at a different temperature than it is played.
+
+### Memory Layout
+
+The `DigitalOscillator`'s `delay_lines_` union is the largest memory consumer. The union member definitions are:
+
+- `comb[8192]` -- 16 KB (int16_t) for the comb filter
+- `ks[1025 * 4]` -- ~8 KB for Karplus-Strong (4 voices, 1025 samples each)
+- `bowed.bridge[1024] + bowed.neck[4096]` -- 5 KB (int8_t) for the bowed string
+- `bore[2048]` -- 4 KB (int16_t) for the blown reed bore
+- `fluted.jet[1024] + fluted.bore[4096]` -- 5 KB (int8_t) for the flute
+
+The largest (comb at 16 KB) dominates. On an STM32F103 with 20 KB of SRAM, this is roughly 80% of RAM just for one oscillator's delay buffers -- which is why the union overlay is essential.
+
+### Fixed-Point DSP Conventions
+
+Throughout the codebase, the following conventions are used consistently:
+
+- **Pitch**: 16-bit integer, 128 units per semitone, `60 << 7 = 7680` = MIDI middle C (C4).
+- **Parameters**: 16-bit, range [0, 32767].
+- **Phase**: 32-bit unsigned, wraps naturally at 2^32. One full cycle = 2^32 counts.
+- **Phase increment**: 32-bit unsigned, precomputed from pitch via lookup + linear interpolation. At 96 kHz, `2^32 / 96000 ≈ 44739` counts per Hz.
+- **Audio samples**: int16_t, range [-32768, 32767].
+- **Waveshaper lookup**: `Interpolate88(table, x)` reads a 257-entry table with 8-bit fractional interpolation, where `x` is a 16-bit unsigned index (`0` = table[0], `0xffff` = table[255]).
+- **`Mix(a, b, t)`**: crossfade where `t = 0` -> `a`, `t = 65535` -> `b`. Implemented as `a + (b - a) * t >> 16`.
+
+These conventions are uniform across `AnalogOscillator`, `DigitalOscillator`, and all helper classes, making it straightforward to port or adapt individual algorithms.
