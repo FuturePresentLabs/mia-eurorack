@@ -25,9 +25,7 @@
 *assembly.zip
 *top.pdf
 *bottom.pdf
-*.csv
 *partlist.txt
-*.zip
 
 # LaTeX compiled file
 *.pdf
@@ -39,6 +37,9 @@
 
 # Build directory
 build
+
+# Backups
+*-backups
 
 # BETA Layout variants
 *_beta.sch
