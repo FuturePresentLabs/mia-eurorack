@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "shades_v30")(type "KiCad")(uri "${KIPRJMOD}/shades_v30.pretty")(options "")(descr ""))
+)
